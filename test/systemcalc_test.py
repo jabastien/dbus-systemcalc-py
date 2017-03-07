@@ -5,7 +5,8 @@ import os
 import sys
 import tempfile
 import unittest
-
+import time
+from datetime import datetime, timedelta
 # our own packages
 test_dir = os.path.dirname(__file__)
 sys.path.insert(0, test_dir)
@@ -106,12 +107,14 @@ class TestSystemCalc(TestSystemCalcBase):
 				'/DeviceInstance': 0,
 				'/Devices/0/Assistants': [0x55, 0x1] + (26 * [0]), # Hub-4 assistant
 				'/Soc': 53.2,
-				'/State': 3
+				'/State': 3,
+				'/VebusSubstate': 1,
+				'/VebusSetChargeState': 0
 			})
 		self._add_device('com.victronenergy.settings',
 			values={
 				'/Settings/SystemSetup/AcInput1': 1,
-				'/Settings/SystemSetup/AcInput2': 2,
+				'/Settings/SystemSetup/AcInput2': 2
 			})
 
 	def test_ac_in_grid(self):
@@ -1654,6 +1657,120 @@ class TestSystemCalc(TestSystemCalcBase):
 			bc.set_sources(self._monitor, self._system_calc._settings, self._service)
 			self.assertEqual(bc._pwm_frequency, None)
 			self.assertEqual(bc._gpio_path, None)
+
+	def test_auto_eq(self):
+		today = datetime.today()
+		starttime = today.time().strftime('%H:%M')
+		interval = 30
+
+		self._set_setting('/Settings/AutoEqualise/Enabled', 0)
+		self._set_setting('/Settings/AutoEqualise/StartDate', today.date().isoformat())
+		self._set_setting('/Settings/AutoEqualise/Interval', 30)
+		self._set_setting('/Settings/AutoEqualise/StartTime', starttime)
+		self._monitor.set_value('com.victronenergy.vebus.ttyO1', '/VebusSubstate', 1)  # Bulk
+
+		self._update_values(5000)
+		self._check_values({
+			'/AutoEqualise/State': 0
+			})
+
+		# Enable and set start date to 30 days ago, equalisation mechanism must start
+		self._set_setting('/Settings/AutoEqualise/Enabled', 1)
+		self._set_setting('/Settings/AutoEqualise/StartDate', (today.date() - timedelta(days=interval)).isoformat())
+
+		self._update_values(5000)
+		self._check_values({
+			'/AutoEqualise/State': 1
+			})
+
+		# Set multi to absorption
+		self._monitor.set_value('com.victronenergy.vebus.ttyO1', '/VebusSubstate', 2)
+		self._update_values(5000)
+		self._check_values({
+			'/AutoEqualise/State': 1
+			})
+
+		# Set multi to equalise
+		self._monitor.set_value('com.victronenergy.vebus.ttyO1', '/VebusSubstate', 7)
+		self._update_values(5000)
+		self._check_values({
+			'/AutoEqualise/State': 2
+			})
+
+		# Set multi to float, this means that equalisation already finished
+		self._monitor.set_value('com.victronenergy.vebus.ttyO1', '/VebusSubstate', 3)
+		self._update_values(5000)
+		self._check_values({
+			'/AutoEqualise/State': 0
+			})
+
+		# Next auto EQ will be in 'interval' days
+		self._update_values(5000)
+		nextdate = (today + timedelta(days=interval)).replace(hour=today.time().hour,
+																	minute=today.time().minute, second=0)
+		self._check_values({
+			'/AutoEqualise/State': 0,
+			'/AutoEqualise/NextEqualisation': time.mktime(nextdate.timetuple())
+			})
+
+	def test_auto_eq_enabled_already_in_eq(self):
+		today = datetime.today()
+		starttime = today.time().strftime('%H:%M')
+		interval = 30
+		self._monitor.set_value('com.victronenergy.vebus.ttyO1', '/VebusSubstate', 7)
+		self._set_setting('/Settings/AutoEqualise/Enabled', 1)
+		self._set_setting('/Settings/AutoEqualise/Interval', 30)
+		self._set_setting('/Settings/AutoEqualise/StartTime', starttime)
+
+		self._set_setting('/Settings/AutoEqualise/StartDate', (today.date() - timedelta(days=interval)).isoformat())
+		self._update_values(5000)
+		self._check_values({
+			'/AutoEqualise/State': 2
+			})
+
+	def test_auto_eq_manual(self):
+		today = datetime.today()
+		starttime = today.time().strftime('%H:%M')
+		interval = 30
+		self._set_setting('/Settings/AutoEqualise/Enabled', 0)
+		self._service['/AutoEqualise/ManualEqualisation'] = 1
+
+		self._update_values(5000)
+		self._check_values({
+			'/AutoEqualise/State': 1
+			})
+		self._monitor.set_value('com.victronenergy.vebus.ttyO1', '/VebusSubstate', 7)
+		self._update_values(5000)
+		self._check_values({
+			'/AutoEqualise/State': 2
+			})
+
+
+	def test_auto_eq_timed_out(self):
+		today = datetime.today()
+		starttime = today.time().strftime('%H:%M')
+		interval = 30
+		self._set_setting('/Settings/AutoEqualise/Enabled', 1)
+		self._set_setting('/Settings/AutoEqualise/StartDate', today.date().isoformat())
+		self._set_setting('/Settings/AutoEqualise/Interval', 30)
+		self._set_setting('/Settings/AutoEqualise/StartTime', starttime)
+		self._monitor.set_value('com.victronenergy.vebus.ttyO1', '/VebusSubstate', 1)
+
+		self._set_setting('/Settings/AutoEqualise/StartDate', (today.date() - timedelta(days=interval)).isoformat())
+		self._update_values(5000)
+		self._check_values({
+			'/AutoEqualise/State': 1
+			})
+		self._set_setting('/Settings/AutoEqualise/LastStarted', time.mktime((today - timedelta(hours=9)).timetuple()))
+		self._update_values(5000)
+		self._check_values({
+			'/AutoEqualise/State': 1
+			})
+		self._set_setting('/Settings/AutoEqualise/LastStarted', time.mktime((today - timedelta(hours=10)).timetuple()))
+		self._update_values(5000)
+		self._check_values({
+			'/AutoEqualise/State': 0
+			})
 
 
 class TestSystemCalcNoMulti(TestSystemCalcBase):

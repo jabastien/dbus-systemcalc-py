@@ -105,7 +105,8 @@ class SystemCalc:
 			'com.victronenergy.settings' : {
 				'/Settings/SystemSetup/AcInput1' : dummy,
 				'/Settings/SystemSetup/AcInput2' : dummy,
-				'/Settings/CGwacs/RunWithoutGridMeter' : dummy}
+				'/Settings/CGwacs/RunWithoutGridMeter' : dummy,
+				'/Settings/System/TimeZone' : dummy}
 		}
 
 		service_supervisor = delegates.ServiceSupervisor()
@@ -117,7 +118,8 @@ class SystemCalc:
 			delegates.RelayState(),
 			delegates.BuzzerControl(),
 			delegates.LgCircuitBreakerDetect(),
-			delegates.Hub1Bridge(service_supervisor)]
+			delegates.Hub1Bridge(service_supervisor),
+			delegates.AutoEqualise()]
 
 		for m in self._modules:
 			for service, paths in m.get_input():
@@ -348,6 +350,11 @@ class SystemCalc:
 
 	def _updatevalues(self):
 		# ==== PREPARATIONS ====
+		# Set the user timezone
+		if 'TZ' not in os.environ or not os.environ['TZ']:
+			tz = self._dbusmonitor.get_value('com.victronenergy.settings', '/Settings/System/TimeZone')
+			os.environ['TZ'] = tz if tz else ''
+
 		# Determine values used in logic below
 		vebusses = self._dbusmonitor.get_service_list('com.victronenergy.vebus')
 		vebuspower = 0
@@ -660,6 +667,10 @@ class SystemCalc:
 		if (dbusPath in ['/Connected', '/ProductName', '/Mgmt/Connection'] or
 			(dbusPath == '/State' and dbusServiceName.split('.')[0:3] == ['com', 'victronenergy', 'vebus'])):
 			self._handleservicechange()
+
+		# Track the timezone changes
+		if dbusPath == '/Settings/System/TimeZone':
+			os.environ['TZ'] = changes['Value'] if changes['Value'] else 'UTC'
 
 	def _device_added(self, service, instance, do_service_change=True):
 		if do_service_change:

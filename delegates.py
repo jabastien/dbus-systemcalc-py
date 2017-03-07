@@ -12,6 +12,8 @@ import sc_utils
 import signal
 import sys
 import traceback
+from datetime import datetime, timedelta
+import time
 
 # Victron packages
 sys.path.insert(1, os.path.join(os.path.dirname(__file__), 'ext', 'velib_python'))
@@ -597,3 +599,112 @@ class ServiceSupervisor(SystemCalcDelegate):
 				os.kill(pid, signal.SIGKILL)
 		except (OSError, dbus.exceptions.DBusException):
 			traceback.print_exc()
+
+class AutoEqualise(SystemCalcDelegate):
+
+	def __init__(self):
+		# Auto equalise states
+		self.IDLE = 0
+		self.CHARGETOABSORPTION = 1
+		self.EQUALISING = 2
+
+		# Vebus substates
+		self.INITIALIZING = 0
+		self.BULK = 1
+		self.ABSORPTION = 2
+		self.FLOAT = 3
+		self.EQUALISE = 7
+		self.FORCEEQCMD = 1
+
+		gobject.idle_add(exit_on_error, lambda: not self._update_eq_state())
+		gobject.timeout_add(5000, exit_on_error, self._update_eq_state)
+
+	def set_sources(self, dbusmonitor, settings, dbusservice):
+		SystemCalcDelegate.set_sources(self, dbusmonitor, settings, dbusservice)
+		self._dbusservice.add_path('/AutoEqualise/State', value=self.IDLE)
+		self._dbusservice.add_path('/AutoEqualise/ManualEqualisation', value=0, writeable=True)
+		self._dbusservice.add_path('/AutoEqualise/NextEqualisation', value=0)
+
+	def _update_eq_state(self):
+		vebusservice = self._dbusservice['/VebusService']
+		autoeqenabled = self._settings['autoeqenabled'] == 1
+		manualeq = self._dbusservice['/AutoEqualise/ManualEqualisation'] == 1
+		autoeqstate = self._dbusservice['/AutoEqualise/State']
+
+		if not vebusservice or not (autoeqenabled or manualeq or autoeqstate != self.IDLE):
+			return True
+
+		now = datetime.now()
+		firsteqdate = datetime.strptime(self._settings['autoeqfirsteqdate'], '%Y-%m-%d')
+		starttime = datetime.strptime(self._settings['autoeqstarttime'], '%H:%M').time()
+		interval = self._settings['autoeqinterval']
+		gap = (now.date() - firsteqdate.date()).days % interval
+		lasteq = datetime.fromtimestamp(self._settings['autoeqlastcompleted'])
+		chargerstate = self._dbusmonitor.get_value(vebusservice, '/VebusSubstate')
+		autoeqstate = self._dbusservice['/AutoEqualise/State']
+		manualeq = self._dbusservice['/AutoEqualise/ManualEqualisation'] == 1
+
+		# If state is not idle means that the process already started so set start to true
+		# this is necessary in case day changes during equalise process
+		start = (autoeqenabled and autoeqstate != self.IDLE) or manualeq
+
+		# Determine if auto equalise should start and the next equalisation date
+		if firsteqdate.date() > now.date():
+			# First EQ is set to a date in the future, wait till then
+			nextdate = firsteqdate.replace(hour=starttime.hour, minute=starttime.minute, second=0)
+			self._dbusservice['/AutoEqualise/NextEqualisation'] = time.mktime(nextdate.timetuple())
+		elif gap == 0 and lasteq.date() != now.date() or start:
+			startdatetime = now.replace(hour=starttime.hour, minute=starttime.minute)
+			self._dbusservice['/AutoEqualise/NextEqualisation'] = time.mktime(startdatetime.timetuple())
+			start = now >= startdatetime or start
+		else:
+			nextdate = now + timedelta(days=interval - gap)
+			nextdate = nextdate.replace(hour=starttime.hour, minute=starttime.minute, second=0)
+			self._dbusservice['/AutoEqualise/NextEqualisation'] = time.mktime(nextdate.timetuple())
+
+		# Set auto equalise and charger states
+		if start and chargerstate >= 0:
+			# Consider auto equalisation timed out when absorption state not reached after 10 hours
+			timedout = (now - datetime.fromtimestamp(self._settings['autoeqlaststarted'])).seconds / 3600 >= 10
+			if autoeqstate == self.CHARGETOABSORPTION and timedout:
+				self._dbusservice['/AutoEqualise/State'] = self.IDLE
+				self._dbusservice['/AutoEqualise/ManualEqualisation'] = 0
+			elif chargerstate != self.EQUALISE and autoeqstate == self.EQUALISING:
+				# Equalisation finished or interrupted when the charger state switches to any other state
+				if not manualeq:
+					self._settings['autoeqlastcompleted'] = self._settings['autoeqlaststarted']
+				self._dbusservice['/AutoEqualise/State'] = self.IDLE
+				self._dbusservice['/AutoEqualise/ManualEqualisation'] = 0
+
+			elif chargerstate in [self.INITIALIZING, self.BULK]:
+				# Don't start equalising when state is bulk, wait till absorption reached
+				if autoeqstate == self.IDLE:
+					self._settings['autoeqlaststarted'] = time.time()
+				self._dbusservice['/AutoEqualise/State'] = self.CHARGETOABSORPTION
+			elif chargerstate != self.EQUALISE:
+				# Charger not equalising yet, send the start command and store the start time.
+				if autoeqstate == self.IDLE and not manualeq:
+					self._settings['autoeqlaststarted'] = time.time()
+				self._dbusmonitor.set_value(vebusservice, '/VebusSetChargeState',
+										dbus.Int32(self.FORCEEQCMD, variant_level=1))
+			elif chargerstate == self.EQUALISE and self._dbusservice['/AutoEqualise/State'] != self.EQUALISING:
+				self._dbusservice['/AutoEqualise/State'] = self.EQUALISING
+		elif chargerstate >= 0:
+			if autoeqstate != self.IDLE:
+				self._dbusservice['/AutoEqualise/State'] = self.IDLE
+
+		return True
+
+	def get_settings(self):
+		return [
+			('autoeqenabled', '/Settings/AutoEqualise/Enabled', 0, 0, 20),
+			('autoeqfirsteqdate', '/Settings/AutoEqualise/StartDate', '2016-01-01', 0, 0),
+			('autoeqstarttime', '/Settings/AutoEqualise/StartTime', '14:00', 0, 0),
+			('autoeqinterval', '/Settings/AutoEqualise/Interval', 180, 1, 365),
+			('autoeqlaststarted', '/Settings/AutoEqualise/LastStarted', 0, 0, 10000000000),
+			('autoeqlastcompleted', '/Settings/AutoEqualise/LastCompleted', 0, 0, 10000000000)]
+
+	def get_input(self):
+		return [
+			('com.victronenergy.vebus', ['/VebusSubstate', '/VebusSetChargeState']),
+			('com.victronenergy.settings', ['/Settings/System/TimeZone'])]
